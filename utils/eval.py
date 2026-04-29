@@ -14,15 +14,23 @@ from utils.helper import clean_answer, answer_match, scanrefer_get_unique_multip
 
 # default_instance_attr_file = "annotations/scannet_mask3d_val_attributes.pt"
 default_instance_attr_file = 'annotations/scannet_deva_attributes_old.pt'
+_default_scannet_val_attr = "annotations/scannet_val_attributes.pt"
+_default_anno_root = "annotations"
+
+def _scannet_val_attr_file(config):
+    return getattr(config, 'gt_val_attr_file', _default_scannet_val_attr) if config is not None else _default_scannet_val_attr
+
+def _anno_root(config):
+    return getattr(config, 'anno_root', _default_anno_root) if config is not None else _default_anno_root
 
 def calc_scanrefer_score(preds, config=None):
     instance_attribute_file = config.val_file_dict['scanrefer'][2] if config is not None else default_instance_attr_file
-    scannet_attribute_file = "annotations/scannet_val_attributes.pt"
+    scannet_attribute_file = _scannet_val_attr_file(config)
 
     instance_attrs = torch.load(instance_attribute_file, map_location='cpu')
     scannet_attrs = torch.load(scannet_attribute_file, map_location='cpu')
 
-    unique_multiple_lookup = scanrefer_get_unique_multiple_lookup()
+    unique_multiple_lookup = scanrefer_get_unique_multiple_lookup(_anno_root(config))
 
     iou25_acc = 0
     iou50_acc = 0
@@ -93,7 +101,7 @@ def calc_scanrefer_score(preds, config=None):
 def calc_referit3d_score(preds, eval_name, config=None):
     acc, easy_acc, hard_acc, view_dep_acc, view_indep_acc = 0, 0, 0, 0, 0
     easy_num, hard_num, dep_num, indep_num = 0, 0, 0, 0
-    scannet_attribute_file = "annotations/scannet_val_attributes.pt"
+    scannet_attribute_file = _scannet_val_attr_file(config)
     scannet_attrs = torch.load(scannet_attribute_file, map_location='cpu')
     
     id_format = "<OBJ\\d{3}>"
@@ -143,7 +151,7 @@ def calc_referit3d_score(preds, eval_name, config=None):
 
 def calc_multi3dref_score(preds, config=None):
     instance_attribute_file = config.val_file_dict['multi3dref'][2] if config is not None else default_instance_attr_file
-    scannet_attribute_file = "annotations/scannet_val_attributes.pt"
+    scannet_attribute_file = _scannet_val_attr_file(config)
 
     instance_attrs = torch.load(instance_attribute_file, map_location='cpu')
     scannet_attrs = torch.load(scannet_attribute_file, map_location='cpu')
@@ -217,12 +225,12 @@ def calc_multi3dref_score(preds, config=None):
 
 def calc_scan2cap_score(preds, tokenizer, scorers, config=None):
     instance_attribute_file = config.val_file_dict['scan2cap'][2] if config is not None else default_instance_attr_file
-    scannet_attribute_file = "annotations/scannet_val_attributes.pt"
+    scannet_attribute_file = _scannet_val_attr_file(config)
 
     instance_attrs = torch.load(instance_attribute_file, map_location='cpu')
     scannet_attrs = torch.load(scannet_attribute_file, map_location='cpu')
 
-    gt_dict = json.load(open('annotations/scan2cap_val_corpus.json'))
+    gt_dict = json.load(open(f'{_anno_root(config)}/scan2cap_val_corpus.json'))
     tmp_preds_iou25 = {}
     tmp_preds_iou50 = {}
     tmp_targets = {}
@@ -375,12 +383,12 @@ def extract_locs(loc_str):
 
 def calc_scanrefer_location_score(preds, config=None):
     instance_attribute_file = config.val_file_dict['scanrefer'][2] if config is not None else default_instance_attr_file
-    scannet_attribute_file = "annotations/scannet_val_attributes.pt"
+    scannet_attribute_file = _scannet_val_attr_file(config)
 
     instance_attrs = torch.load(instance_attribute_file, map_location='cpu')
     scannet_attrs = torch.load(scannet_attribute_file, map_location='cpu')
 
-    unique_multiple_lookup = scanrefer_get_unique_multiple_lookup()
+    unique_multiple_lookup = scanrefer_get_unique_multiple_lookup(_anno_root(config))
 
     iou25_acc = 0
     iou50_acc = 0
@@ -444,7 +452,7 @@ def calc_scanrefer_location_score(preds, config=None):
 
 def calc_multi3dref_location_score(preds, config=None):
     instance_attribute_file = config.val_file_dict['multi3dref'][2] if config is not None else default_instance_attr_file
-    scannet_attribute_file = "annotations/scannet_val_attributes.pt"
+    scannet_attribute_file = _scannet_val_attr_file(config)
 
     instance_attrs = torch.load(instance_attribute_file, map_location='cpu')
     scannet_attrs = torch.load(scannet_attribute_file, map_location='cpu')

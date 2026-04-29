@@ -7,8 +7,7 @@ from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .modeling_llama import LlamaForCausalLM
-from transformers import LlamaTokenizer, LlamaConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from models.position_embedding import PositionEmbeddingCoordsSine
 from peft import LoraConfig, get_peft_model
 # from models.load_llama import init_llama_model
@@ -34,6 +33,46 @@ def print_grad_status(model):
             '(Trainable)' if p.requires_grad else '(Fixed)',
             '(Has grad):' if p.grad is not None else '(No grad backward):',
             list(p.shape)))
+
+
+class AuxGroundingHead(nn.Module):
+    """Modular discriminative grounding head — same as used in Graph3DLLM.
+
+    Scores every valid object against a query vector via a small bilinear
+    network.  Zero-initialized so it starts silent and activates gradually.
+    Supports single-object CE (gt_idx) and multi-object BCE (gt_mask).
+    """
+
+    def __init__(self, dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.obj_proj   = nn.Linear(dim, hidden_dim)
+        self.query_proj = nn.Linear(dim, hidden_dim)
+        self.scorer     = nn.Linear(hidden_dim, 1)
+        nn.init.zeros_(self.scorer.weight)
+        nn.init.zeros_(self.scorer.bias)
+
+    def _logits(self, object_reprs, query_repr, valid_mask):
+        obj_h   = self.obj_proj(object_reprs)
+        q_h     = self.query_proj(query_repr).unsqueeze(0)
+        scores  = self.scorer(F.gelu(obj_h + q_h)).squeeze(-1)
+        return scores.masked_fill(~valid_mask, float('-inf'))
+
+    def forward(self, object_reprs, query_repr, valid_mask, gt_idx=None, gt_mask=None):
+        logits = self._logits(object_reprs, query_repr, valid_mask)
+        if gt_idx is None and gt_mask is None:
+            return logits, None
+        if gt_mask is not None:
+            loss = F.binary_cross_entropy_with_logits(
+                logits[valid_mask], gt_mask[valid_mask].float())
+        else:
+            loss = F.cross_entropy(
+                logits.unsqueeze(0),
+                torch.tensor([gt_idx], device=logits.device))
+        return logits, loss
+
+    def predict(self, object_reprs, query_repr, valid_mask):
+        with torch.no_grad():
+            return int(self._logits(object_reprs, query_repr, valid_mask).argmax().item())
 
 
 class Chat3D(nn.Module):
@@ -70,21 +109,28 @@ class Chat3D(nn.Module):
         self.debug = config.debug
         if not self.debug:
             logger.info('Loading LLaMA')
-            self.llama_tokenizer = LlamaTokenizer.from_pretrained(llama_model_path, use_fast=False, legacy=False)
-            # self.llama_tokenizer.pad_token = self.llama_tokenizer.eos_token
+            self.llama_tokenizer = AutoTokenizer.from_pretrained(llama_model_path, use_fast=True)
+            if self.llama_tokenizer.pad_token is None:
+                self.llama_tokenizer.pad_token = self.llama_tokenizer.eos_token
+            if self.bidirection:
+                _attn_impl = "sdpa"
+            elif torch.cuda.get_device_capability(0)[0] >= 12:
+                _attn_impl = "sdpa"
+            else:
+                _attn_impl = "flash_attention_2"
             if self.low_resource:
-                self.llama_model = LlamaForCausalLM.from_pretrained(
+                self.llama_model = AutoModelForCausalLM.from_pretrained(
                     llama_model_path,
                     torch_dtype=torch.bfloat16,
                     load_in_8bit=True,
                     device_map="auto",
-                    attn_implementation="flash_attention_2"
+                    attn_implementation=_attn_impl,
                 )
             else:
-                self.llama_model = LlamaForCausalLM.from_pretrained(
+                self.llama_model = AutoModelForCausalLM.from_pretrained(
                     llama_model_path,
                     torch_dtype=torch.bfloat16,
-                    attn_implementation="flash_attention_2"
+                    attn_implementation=_attn_impl,
                 )
             # print(torch.cuda.memory_allocated(device="cuda:0")/1e9)
             # self.llama_model = self.llama_model.to("cuda")
@@ -156,6 +202,11 @@ class Chat3D(nn.Module):
             #     self.llama_model.resize_token_embeddings(len(self.llama_tokenizer))
 
             self.llama_dim = self.llama_model.config.hidden_size
+            # Strip sampling params from the model's baked-in generation_config so
+            # greedy decode doesn't trigger "top_k set but do_sample=False" warnings.
+            self.llama_model.generation_config.top_k = None
+            self.llama_model.generation_config.top_p = None
+            self.llama_model.generation_config.temperature = None
             logger.info('Loading LLAMA Done')
         else:
             self.llama_model = None
@@ -207,7 +258,12 @@ class Chat3D(nn.Module):
         if not self.debug:
             self.p_0_embed, self.p_1_embed = self.prepare_fixed_embed()
         self.last_embed = None
-        
+
+        if getattr(config.model, 'use_aux_head', False):
+            self.aux_head = AuxGroundingHead(self.llama_dim)
+        self.aux_head_lambda    = getattr(config.model, 'aux_head_lambda',    0.1)
+        self.aux_head_qa_lambda = getattr(config.model, 'aux_head_qa_lambda', 0.0)
+
         # print_grad_status(self)
 
     def get_objid_embeds(self):
@@ -375,6 +431,7 @@ class Chat3D(nn.Module):
             proj_scene_embed = self.scene_proj(scene_embed)
         
         input_embed_list, attn_list, target_list = [], [], []
+        aux_head_losses, aux_head_accs = [], []
         max_seq_len = 0
         p_0_embed = self.p_0_embed.to(device)
         p_1_embed = self.p_1_embed.to(device)
@@ -383,6 +440,28 @@ class Chat3D(nn.Module):
         for i, question in enumerate(questions):
             prompt = f"{question} {self.role[1]}: "
             prompt_embed = self.get_text_emb(prompt, device=device).squeeze(0)
+
+            if hasattr(self, 'aux_head'):
+                valid_mask_i     = scene_mask[i]
+                valid_global_ids = assigned_ids[i][valid_mask_i]
+                gt_global        = int(obj_ids[i].item())
+                gt_matches       = (valid_global_ids == gt_global).nonzero(as_tuple=True)[0]
+                if len(gt_matches) > 0:
+                    gt_local     = int(gt_matches[0].item())
+                    obj_repr_i   = (proj_object_embed[i] + proj_object_img_embed[i])[valid_mask_i]
+                    query_repr_i = prompt_embed.mean(0)
+                    N_valid      = obj_repr_i.shape[0]
+                    all_valid    = torch.ones(N_valid, dtype=torch.bool, device=device)
+                    is_grounding_answer = '<OBJ' in answers[i]
+                    lam = self.aux_head_lambda if is_grounding_answer else self.aux_head_qa_lambda
+                    if lam > 0:
+                        _, loss_i = self.aux_head(obj_repr_i, query_repr_i, all_valid, gt_idx=gt_local)
+                        if loss_i is not None:
+                            aux_head_losses.append(lam * loss_i)
+                            with torch.no_grad():
+                                pred_i = self.aux_head.predict(obj_repr_i, query_repr_i, all_valid)
+                                aux_head_accs.append(float(pred_i == gt_local))
+
             object_list_embed = self.get_object_list_embed(
                 proj_object_embed[i], 
                 proj_object_img_embed[i] if self.add_img_token else None, 
@@ -451,13 +530,23 @@ class Chat3D(nn.Module):
                 # label_weights=label_weights
             )
 
+        lm_loss = outputs.loss
+        if aux_head_losses:
+            aux_loss  = torch.stack(aux_head_losses).mean()
+            total_loss = lm_loss + aux_loss
+        else:
+            aux_loss   = torch.tensor(0.0, device=device)
+            total_loss = lm_loss
+
         return dict(
-            loss=outputs.loss,
+            loss=total_loss,
             obj_norm=proj_object_embed.norm(dim=-1).mean().detach().cpu(),
             obj_img_norm=proj_object_img_embed.norm(dim=-1).mean().detach().cpu(),
             objid_norm=self.get_objid_embeds().norm(dim=-1).mean().detach().cpu(),
             scene_norm=proj_scene_embed.norm(dim=-1).mean().detach().cpu() if proj_scene_embed is not None else 0.,
-            max_seq_len=max_seq_len
+            max_seq_len=max_seq_len,
+            grounding_loss=aux_loss.detach().cpu(),
+            grounding_acc=float(sum(aux_head_accs) / len(aux_head_accs)) if aux_head_accs else 0.0,
         )
 
     def evaluate(self, scene_feat, scene_img_feat, scene_locs, scene_mask, custom_prompt, obj_ids, assigned_ids, is_eval=True, **kwargs):
@@ -483,48 +572,49 @@ class Chat3D(nn.Module):
             scene_embed = self.relation_module(scene_embed, src_key_padding_mask=~scene_mask)
             proj_scene_embed = self.scene_proj(scene_embed)
 
-        output_texts = []
-        p_0_embed = self.p_0_embed.to(device).unsqueeze(0)
-        p_1_embed = self.p_1_embed.to(device).unsqueeze(0)
+        p_0_embed = self.p_0_embed.to(device)
+        p_1_embed = self.p_1_embed.to(device)
+
+        # Build per-sample context embeddings (variable length per sample)
+        wrapped_embeds = []
         for i in range(batch_size):
             tmp_prompt = f" {custom_prompt[i]} {self.role[1]}: "
             tmp_prompt = update_caption(tmp_prompt, assigned_ids[i])
-            prompt_embed = self.get_text_emb(tmp_prompt, device=device)
+            prompt_embed = self.get_text_emb(tmp_prompt, device=device).squeeze(0)
             object_list_embed = self.get_object_list_embed(
-                proj_object_embed[i], 
-                proj_object_img_embed[i] if self.add_img_token else None, 
-                proj_scene_embed[i] if self.add_scene_token else None, 
+                proj_object_embed[i],
+                proj_object_img_embed[i] if self.add_img_token else None,
+                proj_scene_embed[i] if self.add_scene_token else None,
                 scene_mask[i],
                 obj_ids[i],
-                assigned_ids[i]
+                assigned_ids[i],
             )
-            object_list_embed = object_list_embed.unsqueeze(0)
-            wrapped_embed = torch.cat([p_0_embed, object_list_embed, p_1_embed, prompt_embed], dim=1)
-            attention_mask=None
-            if self.bidirection:
-                seq_len = wrapped_embed.shape[1]
-                attention_mask = torch.ones((seq_len, seq_len), dtype=wrapped_embed.dtype, device=device)
-                attention_mask = torch.tril(attention_mask, diagonal=0)
-                attention_mask = attention_mask[None, None, :, :].expand(1, 1, -1, -1).clone()
-                st, ed = p_0_embed.shape[1], p_0_embed.shape[1] + object_list_embed.shape[1]
-                attention_mask[:, :, st:ed, st:ed] = 1.0
-            
-            with self.maybe_autocast():
-                outputs = self.llama_model.generate(
-                    inputs_embeds=wrapped_embed,
-                    max_new_tokens=self.max_txt_len,
-                    # stopping_criteria=stopping_criteria,
-                    num_beams=5,
-                    # do_sample=True,
-                    min_length=1,
-                    # top_p=0.9,
-                    repetition_penalty=3.0,
-                    length_penalty=1,
-                    temperature=1.0,
-                    customized_mask=attention_mask
-                )
-            output_token = outputs[0]
-            output_text = self.llama_tokenizer.decode(output_token)
+            wrapped_embeds.append(
+                torch.cat([p_0_embed, object_list_embed, p_1_embed, prompt_embed], dim=0)
+            )
+
+        # Left-pad to uniform length, then generate the whole batch at once
+        max_len = max(e.shape[0] for e in wrapped_embeds)
+        D = wrapped_embeds[0].shape[-1]
+        padded = wrapped_embeds[0].new_zeros(batch_size, max_len, D)
+        attn_mask = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+        for i, e in enumerate(wrapped_embeds):
+            pad_len = max_len - e.shape[0]
+            padded[i, pad_len:] = e
+            attn_mask[i, pad_len:] = 1
+
+        with self.maybe_autocast():
+            outputs = self.llama_model.generate(
+                inputs_embeds=padded,
+                attention_mask=attn_mask,
+                max_new_tokens=20,
+                num_beams=1,
+                do_sample=False,
+            )
+
+        output_texts = []
+        for i in range(batch_size):
+            output_text = self.llama_tokenizer.decode(outputs[i])
             output_text = output_text.split(self.end_sym)[0]
             output_text = output_text.replace('  ', ' ').replace(' .', '.').strip()
             output_text = recover_caption(output_text, assigned_ids[i].tolist())
@@ -547,7 +637,7 @@ class Chat3D(nn.Module):
         enable_autocast = self.device != torch.device("cpu")
 
         if enable_autocast:
-            return torch.cuda.amp.autocast(dtype=dtype)
+            return torch.amp.autocast('cuda', dtype=dtype)
         else:
             return contextlib.nullcontext()
 

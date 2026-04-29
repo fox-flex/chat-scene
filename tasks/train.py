@@ -69,7 +69,7 @@ def train(
     metric_logger = MetricLogger(delimiter="  ")
     eval_metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", SmoothedValue(window=1, fmt="{value:.6f}"))
-    loss_names = ["loss", "obj_norm", "obj_img_norm", "objid_norm", "scene_norm"]
+    loss_names = ["loss", "obj_norm", "obj_img_norm", "objid_norm", "scene_norm", "grounding_loss", "grounding_acc"]
     media_types = get_media_types(train_loaders)
 
     # tot_param = sum(p.numel() for p in model_without_ddp.parameters())
@@ -92,11 +92,13 @@ def train(
     train_loader = MetaLoader(name2loader=dict(list(zip(media_types, train_loaders))))
 
     accum_iter = 1
-    eval_freq = 2000  # len(train_loader)
+    eval_freq = len(train_loader)  # len(train_loader)
 
     optimizer.zero_grad()
     iterator = metric_logger.log_every(train_loader, log_freq, header)
     for i, (media_type, batch) in enumerate(iterator):
+        # if i > 10:
+        #     break
         for k in batch.keys():
             if type(batch[k]) == torch.Tensor:
                 batch[k] = batch[k].to(device)
@@ -129,37 +131,31 @@ def train(
 
         global_step += 1
 
-        if do_eval and ((i+1) % eval_freq == 0 and (len(train_loader) - i >= eval_freq) or i == len(train_loader) - 1):
-            val_metrics = evaluate_all(model, model_without_ddp, val_loaders, epoch, global_step, device, config)
-            if is_main_process():
-                for k, v in val_metrics.items():
-                    if k not in eval_metric_logger.meters:
-                        eval_metric_logger.add_meter(k, SmoothedValue(window=1, fmt="{value:.4f}"))
-                eval_metric_logger.update(**val_metrics)
-            if is_main_process() and config.wandb.enable:
-                logs = eval_metric_logger.get_avg_dict()
-                log_dict_to_wandb(logs, step=global_step, prefix="val/")
-            
-            if is_main_process():
-                param_grad_dic = {
-                    k: v.requires_grad for (k, v) in model_without_ddp.named_parameters()
-                }
-                state_dict = model_without_ddp.state_dict()
-                for k in list(state_dict.keys()):
-                    if k in param_grad_dic.keys() and not param_grad_dic[k]:
-                        # delete parameters that do not require gradient
-                        del state_dict[k]
-                save_obj = {
-                    "model": state_dict,
-                    # "optimizer": optimizer.state_dict(),
-                    # "scheduler": scheduler.state_dict(),
-                    # "scaler": scaler.state_dict(),
-                    "config": config,
-                    "epoch": epoch,
-                    "global_step": global_step,
-                }
-                if i != len(train_loader) - 1 and config.do_save and not config.debug:
-                    torch.save(save_obj, join(config.output_dir, f"ckpt_{epoch:02d}_{global_step}.pth"))
+        # if do_eval and ((i+1) % eval_freq == 0 and (len(train_loader) - i >= eval_freq) or i == len(train_loader) - 1):
+    if do_eval:
+        
+        val_metrics = evaluate_all(model, model_without_ddp, val_loaders, epoch, global_step, device, config)
+        
+        if is_main_process():
+            param_grad_dic = {
+                k: v.requires_grad for (k, v) in model_without_ddp.named_parameters()
+            }
+            state_dict = model_without_ddp.state_dict()
+            for k in list(state_dict.keys()):
+                if k in param_grad_dic.keys() and not param_grad_dic[k]:
+                    # delete parameters that do not require gradient
+                    del state_dict[k]
+            save_obj = {
+                "model": state_dict,
+                # "optimizer": optimizer.state_dict(),
+                # "scheduler": scheduler.state_dict(),
+                # "scaler": scaler.state_dict(),
+                "config": config,
+                "epoch": epoch,
+                "global_step": global_step,
+            }
+            if i != len(train_loader) - 1 and config.do_save and not config.debug:
+                torch.save(save_obj, join(config.output_dir, f"ckpt_{epoch:02d}_{global_step}.pth"))
         if global_step > max_global_step:
             return global_step
 
@@ -189,9 +185,11 @@ def evaluate_all(
     logger.info(f"[epoch={epoch}, global steps={global_step}] Val Results:")
     for k, v in val_scores.items():
         logger.info(f"{k}: {v}")
-    
+    if is_main_process() and config.wandb.enable:
+        log_dict_to_wandb(val_scores, step=global_step, prefix="val/")
+
     model.train()
-    model.module.llama_model.config.use_cache = False
+    model_without_ddp.llama_model.config.use_cache = False
     return val_scores
 
 
@@ -208,28 +206,20 @@ def evaluate(
     if config.distributed:
         val_loader.sampler.set_epoch(epoch)
 
-    sample_freq = len(val_loader) // 5 + 1
+    sample_freq = 50
     cosine_scores, l2_distances = [], []
     save_preds = []
     logger.info(f"batch-size={val_loader.batch_size} length(#batches)={len(val_loader)}")
-    for i, batch in tqdm(enumerate(val_loader)):
+    for i, batch in tqdm(enumerate(val_loader), total=len(val_loader), desc=f"eval"):
+        # if i > 11:
+        #     break
         for k in batch.keys():
             if type(batch[k]) == torch.Tensor:
                 batch[k] = batch[k].to(device)
         with torch.no_grad():
             pred = model(**batch, is_eval=True)
-        # if "target_captions" in batch:
-        #     cosine_scores.append(pred["cosine_score"])
-        #     l2_distances.append(pred["l2_dis"])
 
         if "custom_prompt" in batch:
-            # if len(batch["ref_captions"][0]) > 0:
-            #     target = batch["ref_captions"]
-            #     prompt = batch["custom_prompt"]
-            #     tmp_pred = [p.replace("\n", " ").strip() for p in pred]
-            #     tmp_target = ['\n'.join(p) for p in target]
-            #     if i % sample_freq == 0:
-            #         logger.info(f"\n[Prompt]\n{prompt[0]}\n[Pred]\n{tmp_pred[0]}\n[Target(s)]\n{tmp_target[0]}")
             batch_size = len(pred)
             for bi in range(batch_size):
                 scene_id = batch["scene_id"][bi]
@@ -249,8 +239,8 @@ def evaluate(
                     "ref_captions": batch["ref_captions"][bi],
                     "type_info": type_info
                 })
-            # if i % sample_freq == 0:
-            #     print(save_preds[-1])
+            if i % sample_freq == 0:
+                logger.info(f"\n[Prompt]\n{save_preds[-1]['prompt']}\n[Pred]\n{save_preds[-1]['pred']}\n[Target(s)]\n{save_preds[-1]['ref_captions']}")
 
     if len(save_preds) > 0:
         save_preds = sorted(save_preds, key=lambda x: f"{x['scene_id']}_{x['gt_id']:03}_{x['qid']}")
@@ -258,7 +248,8 @@ def evaluate(
                   "w") as f:
             json.dump(save_preds, f, indent=4)
 
-    dist.barrier()
+    if dist.is_initialized():
+        dist.barrier()
     if is_main_process():
         save_preds = []
         for rank in range(config.gpu_num):
@@ -436,7 +427,8 @@ def main(config):
 
             if global_step > max_global_step:
                 break
-            dist.barrier()
+            if dist.is_initialized():
+                dist.barrier()
 
     if config.evaluate:
         evaluate_all(model, model_without_ddp, val_loaders, start_epoch - 1, global_step, device, config)
